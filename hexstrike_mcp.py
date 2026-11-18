@@ -18,8 +18,8 @@ Framework: FastMCP integration for tool orchestration
 """
 
 import sys
-import os
 import argparse
+import copy
 import logging
 from typing import Dict, Any, Optional
 import requests
@@ -114,6 +114,8 @@ class ColoredFormatter(logging.Formatter):
     }
 
     def format(self, record):
+        # A record is shared by all handlers; keep their messages unchanged.
+        record = copy.copy(record)
         emoji = self.EMOJIS.get(record.levelname, '📝')
         color = self.COLORS.get(record.levelname, HexStrikeColors.BRIGHT_WHITE)
 
@@ -121,28 +123,23 @@ class ColoredFormatter(logging.Formatter):
         record.msg = f"{color}{emoji} {record.msg}{HexStrikeColors.RESET}"
         return super().format(record)
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="[🔥 HexStrike MCP] %(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stderr)
-    ]
-)
-
-# Apply colored formatter
-for handler in logging.getLogger().handlers:
+# Configure logging only when running the CLI, without changing host handlers
+# when this module is imported by an MCP client or a test.
+def configure_logging(debug: bool = False) -> None:
+    handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(ColoredFormatter(
         "[🔥 HexStrike MCP] %(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     ))
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(level=level, handlers=[handler])
+    logger.setLevel(level)
 
 logger = logging.getLogger(__name__)
 
 # Default configuration
 DEFAULT_HEXSTRIKE_SERVER = "http://127.0.0.1:8888"  # Default HexStrike server URL
 DEFAULT_REQUEST_TIMEOUT = 300  # 5 minutes default timeout for API requests
-MAX_RETRIES = 3  # Maximum number of retries for connection attempts
 
 class HexStrikeClient:
     """Enhanced client for communicating with the HexStrike AI API Server"""
@@ -155,39 +152,35 @@ class HexStrikeClient:
             server_url: URL of the HexStrike AI API Server
             timeout: Request timeout in seconds
         """
+        if timeout <= 0:
+            raise ValueError("Request timeout must be greater than zero")
         self.server_url = server_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
 
-        # Try to connect to server with retries
-        connected = False
-        for i in range(MAX_RETRIES):
-            try:
-                logger.info(f"🔗 Attempting to connect to HexStrike AI API at {server_url} (attempt {i+1}/{MAX_RETRIES})")
-                # First try a direct connection test before using the health endpoint
-                try:
-                    test_response = self.session.get(f"{self.server_url}/health", timeout=5)
-                    test_response.raise_for_status()
-                    health_check = test_response.json()
-                    connected = True
-                    logger.info(f"🎯 Successfully connected to HexStrike AI API Server at {server_url}")
-                    logger.info(f"🏥 Server health status: {health_check.get('status', 'unknown')}")
-                    logger.info(f"📊 Server version: {health_check.get('version', 'unknown')}")
-                    break
-                except requests.exceptions.ConnectionError:
-                    logger.warning(f"🔌 Connection refused to {server_url}. Make sure the HexStrike AI server is running.")
-                    time.sleep(2)  # Wait before retrying
-                except Exception as e:
-                    logger.warning(f"⚠️  Connection test failed: {str(e)}")
-                    time.sleep(2)  # Wait before retrying
-            except Exception as e:
-                logger.warning(f"❌ Connection attempt {i+1} failed: {str(e)}")
-                time.sleep(2)  # Wait before retrying
+        # Connect lazily so backend outages cannot block MCP initialization.
 
-        if not connected:
-            error_msg = f"Failed to establish connection to HexStrike AI API Server at {server_url} after {MAX_RETRIES} attempts"
-            logger.error(error_msg)
-            # We'll continue anyway to allow the MCP server to start, but tools will likely fail
+    def close(self) -> None:
+        """Release the HTTP connection pool."""
+        self.session.close()
+
+    def _request(self, method: str, endpoint: str, **kwargs: Any) -> Dict[str, Any]:
+        """Return an API object or a structured transport/response error."""
+        url = f"{self.server_url}/{endpoint.lstrip('/')}"
+        try:
+            logger.debug("%s %s", method, url)
+            response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, dict):
+                return {"error": "Invalid API response: expected a JSON object", "success": False}
+            return result
+        except requests.exceptions.RequestException as e:
+            logger.error("Request failed: %s", e)
+            return {"error": f"Request failed: {e}", "success": False}
+        except ValueError as e:
+            logger.error("Invalid JSON response: %s", e)
+            return {"error": f"Invalid JSON response: {e}", "success": False}
 
     def safe_get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -200,22 +193,7 @@ class HexStrikeClient:
         Returns:
             Response data as dictionary
         """
-        if params is None:
-            params = {}
-
-        url = f"{self.server_url}/{endpoint}"
-
-        try:
-            logger.debug(f"📡 GET {url} with params: {params}")
-            response = self.session.get(url, params=params, timeout=self.timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"🚫 Request failed: {str(e)}")
-            return {"error": f"Request failed: {str(e)}", "success": False}
-        except Exception as e:
-            logger.error(f"💥 Unexpected error: {str(e)}")
-            return {"error": f"Unexpected error: {str(e)}", "success": False}
+        return self._request("GET", endpoint, params=params or {})
 
     def safe_post(self, endpoint: str, json_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -228,19 +206,11 @@ class HexStrikeClient:
         Returns:
             Response data as dictionary
         """
-        url = f"{self.server_url}/{endpoint}"
+        return self._request("POST", endpoint, json=json_data)
 
-        try:
-            logger.debug(f"📡 POST {url} with data: {json_data}")
-            response = self.session.post(url, json=json_data, timeout=self.timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"🚫 Request failed: {str(e)}")
-            return {"error": f"Request failed: {str(e)}", "success": False}
-        except Exception as e:
-            logger.error(f"💥 Unexpected error: {str(e)}")
-            return {"error": f"Unexpected error: {str(e)}", "success": False}
+    def safe_delete(self, endpoint: str, json_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Perform a DELETE request with a JSON body."""
+        return self._request("DELETE", endpoint, json=json_data)
 
     def execute_command(self, command: str, use_cache: bool = True) -> Dict[str, Any]:
         """
@@ -880,7 +850,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
             "filename": filename
         }
         logger.info(f"🗑️  Deleting file: {filename}")
-        result = hexstrike_client.safe_post("api/files/delete", data)
+        result = hexstrike_client.safe_delete("api/files/delete", data)
         if result.get("success"):
             logger.info(f"✅ File deleted successfully: {filename}")
         else:
@@ -2681,7 +2651,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         Execute httpx for fast HTTP probing and technology detection.
 
         Args:
-            target: Target file or single URL
+            target: Path to a target list file on the HexStrike API server
             probe: Enable probing
             tech_detect: Enable technology detection
             status_code: Show status codes
@@ -3389,42 +3359,6 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def httpx_probe(targets: str = "", target_file: str = "", ports: str = "", methods: str = "GET", status_code: str = "", content_length: bool = False, output_file: str = "", additional_args: str = "") -> Dict[str, Any]:
-        """
-        Execute HTTPx for HTTP probing with enhanced logging.
-
-        Args:
-            targets: Target URLs or IPs
-            target_file: File containing targets
-            ports: Ports to probe
-            methods: HTTP methods to use
-            status_code: Filter by status code
-            content_length: Show content length
-            output_file: Output file path
-            additional_args: Additional HTTPx arguments
-
-        Returns:
-            HTTP probing results
-        """
-        data = {
-            "targets": targets,
-            "target_file": target_file,
-            "ports": ports,
-            "methods": methods,
-            "status_code": status_code,
-            "content_length": content_length,
-            "output_file": output_file,
-            "additional_args": additional_args
-        }
-        logger.info(f"🌐 Starting HTTPx probing")
-        result = hexstrike_client.safe_post("api/tools/httpx", data)
-        if result.get("success"):
-            logger.info(f"✅ HTTPx probing completed")
-        else:
-            logger.error(f"❌ HTTPx probing failed")
-        return result
-
-    @mcp.tool()
     def paramspider_discovery(domain: str, exclude: str = "", output_file: str = "", level: int = 2, additional_args: str = "") -> Dict[str, Any]:
         """
         Execute ParamSpider for parameter discovery with enhanced logging.
@@ -3442,7 +3376,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         data = {
             "domain": domain,
             "exclude": exclude,
-            "output_file": output_file,
+            "output": output_file,
             "level": level,
             "additional_args": additional_args
         }
@@ -3457,42 +3391,6 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
     # ============================================================================
     # ADVANCED WEB SECURITY TOOLS CONTINUED
     # ============================================================================
-
-    @mcp.tool()
-    def burpsuite_scan(project_file: str = "", config_file: str = "", target: str = "", headless: bool = False, scan_type: str = "", scan_config: str = "", output_file: str = "", additional_args: str = "") -> Dict[str, Any]:
-        """
-        Execute Burp Suite with enhanced logging.
-
-        Args:
-            project_file: Burp project file path
-            config_file: Burp configuration file path
-            target: Target URL
-            headless: Run in headless mode
-            scan_type: Type of scan to perform
-            scan_config: Scan configuration
-            output_file: Output file path
-            additional_args: Additional Burp Suite arguments
-
-        Returns:
-            Burp Suite scan results
-        """
-        data = {
-            "project_file": project_file,
-            "config_file": config_file,
-            "target": target,
-            "headless": headless,
-            "scan_type": scan_type,
-            "scan_config": scan_config,
-            "output_file": output_file,
-            "additional_args": additional_args
-        }
-        logger.info(f"🔍 Starting Burp Suite scan")
-        result = hexstrike_client.safe_post("api/tools/burpsuite", data)
-        if result.get("success"):
-            logger.info(f"✅ Burp Suite scan completed")
-        else:
-            logger.error(f"❌ Burp Suite scan failed")
-        return result
 
     @mcp.tool()
     def zap_scan(target: str = "", scan_type: str = "baseline", api_key: str = "", daemon: bool = False, port: str = "8090", host: str = "0.0.0.0", format_type: str = "xml", output_file: str = "", additional_args: str = "") -> Dict[str, Any]:
@@ -3533,17 +3431,18 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def arjun_scan(url: str, method: str = "GET", data: str = "", headers: str = "", timeout: str = "", output_file: str = "", additional_args: str = "") -> Dict[str, Any]:
+    def arjun_scan(url: str, method: str = "GET", wordlist: str = "", delay: float = 0,
+                   threads: int = 25, stable: bool = False, additional_args: str = "") -> Dict[str, Any]:
         """
         Execute Arjun for parameter discovery with enhanced logging.
 
         Args:
             url: Target URL
             method: HTTP method (GET, POST, etc.)
-            data: POST data for testing
-            headers: Custom headers
-            timeout: Request timeout
-            output_file: Output file path
+            wordlist: Parameter wordlist path
+            delay: Delay between requests in seconds
+            threads: Number of threads
+            stable: Enable stable mode
             additional_args: Additional Arjun arguments
 
         Returns:
@@ -3552,10 +3451,10 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         data = {
             "url": url,
             "method": method,
-            "data": data,
-            "headers": headers,
-            "timeout": timeout,
-            "output_file": output_file,
+            "wordlist": wordlist,
+            "delay": delay,
+            "threads": threads,
+            "stable": stable,
             "additional_args": additional_args
         }
         logger.info(f"🔍 Starting Arjun parameter discovery: {url}")
@@ -3646,132 +3545,36 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
 
     @mcp.tool()
     def autorecon_scan(
-        target: str = "",
-        target_file: str = "",
-        ports: str = "",
-        output_dir: str = "",
-        max_scans: str = "",
-        max_port_scans: str = "",
-        heartbeat: str = "",
-        timeout: str = "",
-        target_timeout: str = "",
-        config_file: str = "",
-        global_file: str = "",
-        plugins_dir: str = "",
-        add_plugins_dir: str = "",
-        tags: str = "",
-        exclude_tags: str = "",
-        port_scans: str = "",
-        service_scans: str = "",
-        reports: str = "",
-        single_target: bool = False,
-        only_scans_dir: bool = False,
-        no_port_dirs: bool = False,
-        nmap: str = "",
-        nmap_append: str = "",
-        proxychains: bool = False,
-        disable_sanity_checks: bool = False,
-        disable_keyboard_control: bool = False,
-        force_services: str = "",
-        accessible: bool = False,
-        verbose: int = 0,
-        curl_path: str = "",
-        dirbuster_tool: str = "",
-        dirbuster_wordlist: str = "",
-        dirbuster_threads: str = "",
-        dirbuster_ext: str = "",
-        onesixtyone_community_strings: str = "",
-        global_username_wordlist: str = "",
-        global_password_wordlist: str = "",
-        global_domain: str = "",
+        target: str,
+        output_dir: str = "/tmp/autorecon",
+        heartbeat: int = 60,
+        timeout: int = 300,
+        port_scans: str = "top-100-ports",
+        service_scans: str = "default",
         additional_args: str = ""
     ) -> Dict[str, Any]:
         """
-        Execute AutoRecon for comprehensive target enumeration with full parameter support.
+        Execute AutoRecon using the options supported by the HexStrike API.
 
         Args:
             target: Single target to scan
-            target_file: File containing multiple targets
-            ports: Specific ports to scan
             output_dir: Output directory
-            max_scans: Maximum number of concurrent scans
-            max_port_scans: Maximum number of concurrent port scans
             heartbeat: Heartbeat interval
             timeout: Global timeout
-            target_timeout: Per-target timeout
-            config_file: Configuration file path
-            global_file: Global configuration file
-            plugins_dir: Plugins directory
-            add_plugins_dir: Additional plugins directory
-            tags: Plugin tags to include
-            exclude_tags: Plugin tags to exclude
             port_scans: Port scan plugins to run
             service_scans: Service scan plugins to run
-            reports: Report plugins to run
-            single_target: Use single target directory structure
-            only_scans_dir: Only create scans directory
-            no_port_dirs: Don't create port directories
-            nmap: Custom nmap command
-            nmap_append: Arguments to append to nmap
-            proxychains: Use proxychains
-            disable_sanity_checks: Disable sanity checks
-            disable_keyboard_control: Disable keyboard control
-            force_services: Force service detection
-            accessible: Enable accessible output
-            verbose: Verbosity level (0-3)
-            curl_path: Custom curl path
-            dirbuster_tool: Directory busting tool
-            dirbuster_wordlist: Directory busting wordlist
-            dirbuster_threads: Directory busting threads
-            dirbuster_ext: Directory busting extensions
-            onesixtyone_community_strings: SNMP community strings
-            global_username_wordlist: Global username wordlist
-            global_password_wordlist: Global password wordlist
-            global_domain: Global domain
             additional_args: Additional AutoRecon arguments
 
         Returns:
-            Comprehensive enumeration results with full configurability
+            Enumeration results
         """
         data = {
             "target": target,
-            "target_file": target_file,
-            "ports": ports,
             "output_dir": output_dir,
-            "max_scans": max_scans,
-            "max_port_scans": max_port_scans,
             "heartbeat": heartbeat,
             "timeout": timeout,
-            "target_timeout": target_timeout,
-            "config_file": config_file,
-            "global_file": global_file,
-            "plugins_dir": plugins_dir,
-            "add_plugins_dir": add_plugins_dir,
-            "tags": tags,
-            "exclude_tags": exclude_tags,
             "port_scans": port_scans,
             "service_scans": service_scans,
-            "reports": reports,
-            "single_target": single_target,
-            "only_scans_dir": only_scans_dir,
-            "no_port_dirs": no_port_dirs,
-            "nmap": nmap,
-            "nmap_append": nmap_append,
-            "proxychains": proxychains,
-            "disable_sanity_checks": disable_sanity_checks,
-            "disable_keyboard_control": disable_keyboard_control,
-            "force_services": force_services,
-            "accessible": accessible,
-            "verbose": verbose,
-            "curl_path": curl_path,
-            "dirbuster_tool": dirbuster_tool,
-            "dirbuster_wordlist": dirbuster_wordlist,
-            "dirbuster_threads": dirbuster_threads,
-            "dirbuster_ext": dirbuster_ext,
-            "onesixtyone_community_strings": onesixtyone_community_strings,
-            "global_username_wordlist": global_username_wordlist,
-            "global_password_wordlist": global_password_wordlist,
-            "global_domain": global_domain,
             "additional_args": additional_args
         }
         logger.info(f"🔍 Starting AutoRecon comprehensive enumeration: {target}")
@@ -5413,58 +5216,59 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
 
     return mcp
 
-def parse_args():
+def positive_timeout(value: str) -> int:
+    """Parse a positive request timeout for argparse."""
+    try:
+        timeout = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("timeout must be a positive integer") from None
+    if timeout <= 0:
+        raise argparse.ArgumentTypeError("timeout must be a positive integer")
+    return timeout
+
+
+def parse_args(argv=None):
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run the HexStrike AI MCP Client")
     parser.add_argument("--server", type=str, default=DEFAULT_HEXSTRIKE_SERVER,
                       help=f"HexStrike AI API server URL (default: {DEFAULT_HEXSTRIKE_SERVER})")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_REQUEST_TIMEOUT,
+    parser.add_argument("--timeout", type=positive_timeout, default=DEFAULT_REQUEST_TIMEOUT,
                       help=f"Request timeout in seconds (default: {DEFAULT_REQUEST_TIMEOUT})")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 def main():
     """Main entry point for the MCP server."""
     args = parse_args()
+    configure_logging(args.debug)
 
     # Configure logging based on debug flag
     if args.debug:
-        logger.setLevel(logging.DEBUG)
         logger.debug("🔍 Debug logging enabled")
 
     # MCP compatibility: No banner output to avoid JSON parsing issues
     logger.info(f"🚀 Starting HexStrike AI MCP Client v6.0")
     logger.info(f"🔗 Connecting to: {args.server}")
 
+    hexstrike_client = None
     try:
         # Initialize the HexStrike AI client
         hexstrike_client = HexStrikeClient(args.server, args.timeout)
-
-        # Check server health and log the result
-        health = hexstrike_client.check_health()
-        if "error" in health:
-            logger.warning(f"⚠️  Unable to connect to HexStrike AI API server at {args.server}: {health['error']}")
-            logger.warning("🚀 MCP server will start, but tool execution may fail")
-        else:
-            logger.info(f"🎯 Successfully connected to HexStrike AI API server at {args.server}")
-            logger.info(f"🏥 Server health status: {health['status']}")
-            logger.info(f"📊 Version: {health.get('version', 'unknown')}")
-            if not health.get("all_essential_tools_available", False):
-                logger.warning("⚠️  Not all essential tools are available on the HexStrike server")
-                missing_tools = [tool for tool, available in health.get("tools_status", {}).items() if not available]
-                if missing_tools:
-                    logger.warning(f"❌ Missing tools: {', '.join(missing_tools[:5])}{'...' if len(missing_tools) > 5 else ''}")
 
         # Set up and run the MCP server
         mcp = setup_mcp_server(hexstrike_client)
         logger.info("🚀 Starting HexStrike AI MCP server")
         logger.info("🤖 Ready to serve AI agents with enhanced cybersecurity capabilities")
+        logger.info("Use server_health to check API connectivity and tool availability")
         mcp.run()
+    except KeyboardInterrupt:
+        logger.info("HexStrike AI MCP server stopped")
     except Exception as e:
-        logger.error(f"💥 Error starting MCP server: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.exception("Error running MCP server: %s", e)
         sys.exit(1)
+    finally:
+        if hexstrike_client is not None:
+            hexstrike_client.close()
 
 if __name__ == "__main__":
     main()

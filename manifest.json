@@ -1,0 +1,65 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-v0.2.schema.json",
+  "manifest_version": "0.2",
+  "name": "hexstrike-ai",
+  "display_name": "HexStrike AI",
+  "version": "1.0.0",
+  "description": "Connect MCP clients to a running HexStrike AI API server.",
+  "long_description": "Provides HexStrike AI tools through a Python MCP server. Requires Python 3.10 or newer with the dependencies in requirements-mcp.txt installed, and a separately running HexStrike AI API server.",
+  "author": {
+    "name": "joseph",
+    "email": "josephaugusto.gaffud@gmail.com"
+  },
+  "icon": "assets/hexstrike-logo.png",
+  "server": {
+    "type": "python",
+    "entry_point": "hexstrike_mcp.py",
+    "mcp_config": {
+      "command": "${user_config.python_path}",
+      "args": [
+        "${__dirname}/hexstrike_mcp.py",
+        "--server",
+        "${user_config.server_url}"
+      ],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "server_health",
+      "description": "Check HexStrike AI API server health and tool availability."
+    }
+  ],
+  "tools_generated": true,
+  "user_config": {
+    "python_path": {
+      "type": "file",
+      "title": "Python executable",
+      "description": "Select a Python 3.10+ executable with requirements-mcp.txt installed, such as .venv-mcp/Scripts/python.exe on Windows or .venv-mcp/bin/python on Linux/macOS.",
+      "required": true
+    },
+    "server_url": {
+      "type": "string",
+      "title": "HexStrike API URL",
+      "description": "Base URL of the running HexStrike AI API server.",
+      "required": false,
+      "default": "http://127.0.0.1:8888"
+    }
+  },
+  "keywords": [
+    "hexstrike",
+    "cybersecurity",
+    "mcp",
+    "python"
+  ],
+  "license": "MIT",
+  "compatibility": {
+    "platforms": ["win32", "linux", "darwin"],
+    "runtimes": {
+      "python": ">=3.10.0 <4.0.0"
+    }
+  }
+}

@@ -216,6 +216,36 @@ curl -X POST http://localhost:8888/api/intelligence/analyze-target \
 
 ## AI Client Integration Setup
 
+### MCP bundle manifest
+
+`manifest.json` launches `hexstrike_mcp.py` using an existing Python environment.
+For the MCP client only, install the smaller dependency set below; the API server
+still needs its own setup from the installation section.
+
+```powershell
+# Windows PowerShell
+python -m venv .venv-mcp
+.\.venv-mcp\Scripts\python.exe -m pip install -r requirements-mcp.txt
+```
+
+```bash
+# Linux/macOS
+python3 -m venv .venv-mcp
+.venv-mcp/bin/python -m pip install -r requirements-mcp.txt
+```
+
+When configuring the extension, select the absolute path to that environment's
+Python executable for **Python executable**. Set **HexStrike API URL** to the
+running API server's address (default `http://127.0.0.1:8888`). The manifest starts
+the MCP client; start `hexstrike_server.py` separately. Tools are discovered from
+the running MCP server, with `server_health` listed as a featured tool.
+MCP initialization does not wait for the API server. Call `server_health` to
+check connectivity; HTTP failures are returned as structured errors.
+
+This configuration uses installed dependencies. To distribute a self-contained
+Python MCP bundle, also bundle the Python dependencies as described in the
+[MCPB manifest specification](https://github.com/modelcontextprotocol/mcpb/blob/main/MANIFEST.md#server-configuration).
+
 ### Claude Desktop Integration or Cursor
 
 Edit `~/.config/Claude/claude_desktop_config.json`:
